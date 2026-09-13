@@ -16,7 +16,10 @@ import math
 from typing import Any
 
 import pytest
-from langchain_core.callbacks import CallbackManagerForRetrieverRun
+from langchain_core.callbacks import (
+    AsyncCallbackManagerForRetrieverRun,
+    CallbackManagerForRetrieverRun,
+)
 from langchain_core.documents import Document
 from langchain_core.retrievers import BaseRetriever
 from pydantic import Field
@@ -47,6 +50,11 @@ class _FakeRetriever(BaseRetriever):
     ) -> list[Document]:
         return self.documents
 
+    async def _aget_relevant_documents(
+        self, query: str, *, run_manager: AsyncCallbackManagerForRetrieverRun
+    ) -> list[Document]:
+        return self.documents
+
     def _get_ls_params(self, **kwargs: Any) -> Any:
         params = super()._get_ls_params(**kwargs)
         params["ls_vector_store_provider"] = "FakeVectorStore"
@@ -58,6 +66,11 @@ class _ErrorRetriever(BaseRetriever):
 
     def _get_relevant_documents(
         self, query: str, *, run_manager: CallbackManagerForRetrieverRun
+    ) -> list[Document]:
+        raise RuntimeError("retrieval failed")
+
+    async def _aget_relevant_documents(
+        self, query: str, *, run_manager: AsyncCallbackManagerForRetrieverRun
     ) -> list[Document]:
         raise RuntimeError("retrieval failed")
 
@@ -699,5 +712,222 @@ def test_retriever_documents_with_non_finite_scores(
         assert len(parsed) == 4
         for item in parsed:
             assert "score" not in item
+    finally:
+        instrumentor.uninstrument()
+
+
+def test_retriever_documents_with_metadata_relevance_score(
+    span_exporter,
+    tracer_provider,
+    meter_provider,
+    logger_provider,
+    monkeypatch,
+):
+    monkeypatch.setenv(
+        "OTEL_SEMCONV_STABILITY_OPT_IN", "gen_ai_latest_experimental"
+    )
+    monkeypatch.setenv(
+        "OTEL_INSTRUMENTATION_GENAI_CAPTURE_MESSAGE_CONTENT", "SPAN_ONLY"
+    )
+    instrumentor = LangChainInstrumentor()
+    instrumentor.instrument(
+        tracer_provider=tracer_provider,
+        meter_provider=meter_provider,
+        logger_provider=logger_provider,
+    )
+    try:
+        docs = [
+            Document(
+                page_content="contextual content",
+                id="doc-rerank-1",
+                metadata={"relevance_score": 0.88},
+            )
+        ]
+        retriever = _FakeRetriever(documents=docs)
+        retriever.invoke("query")
+
+        spans = span_exporter.get_finished_spans()
+        docs_attr = spans[0].attributes[
+            gen_ai_attributes.GEN_AI_RETRIEVAL_DOCUMENTS
+        ]
+        parsed = json.loads(docs_attr)
+        assert len(parsed) == 1
+        assert parsed[0]["content"] == "contextual content"
+        assert parsed[0]["id"] == "doc-rerank-1"
+        assert parsed[0]["score"] == 0.88
+    finally:
+        instrumentor.uninstrument()
+
+
+@pytest.mark.asyncio
+async def test_async_retriever_documents_with_scores(
+    span_exporter,
+    tracer_provider,
+    meter_provider,
+    logger_provider,
+    monkeypatch,
+):
+    monkeypatch.setenv(
+        "OTEL_SEMCONV_STABILITY_OPT_IN", "gen_ai_latest_experimental"
+    )
+    monkeypatch.setenv(
+        "OTEL_INSTRUMENTATION_GENAI_CAPTURE_MESSAGE_CONTENT", "SPAN_ONLY"
+    )
+    instrumentor = LangChainInstrumentor()
+    instrumentor.instrument(
+        tracer_provider=tracer_provider,
+        meter_provider=meter_provider,
+        logger_provider=logger_provider,
+    )
+    try:
+        docs = [
+            Document(
+                page_content="kb content",
+                id="doc-kb",
+                metadata={"score": 0.95},
+            ),
+            Document(
+                page_content="rerank content",
+                id="doc-cohere",
+                metadata={"relevance_score": 0.82},
+            ),
+            Document(
+                page_content="unscored content",
+                id="doc-plain",
+                metadata={"source": "plain.txt"},
+            ),
+        ]
+        retriever = _FakeRetriever(documents=docs)
+        await retriever.ainvoke("async query")
+
+        spans = span_exporter.get_finished_spans()
+        assert len(spans) == 1
+        docs_attr = spans[0].attributes[
+            gen_ai_attributes.GEN_AI_RETRIEVAL_DOCUMENTS
+        ]
+        parsed = json.loads(docs_attr)
+        assert len(parsed) == 3
+
+        assert parsed[0]["id"] == "doc-kb"
+        assert parsed[0]["score"] == 0.95
+
+        assert parsed[1]["id"] == "doc-cohere"
+        assert parsed[1]["score"] == 0.82
+
+        assert parsed[2]["id"] == "doc-plain"
+        assert "score" not in parsed[2]
+    finally:
+        instrumentor.uninstrument()
+
+
+@pytest.mark.parametrize("is_async", [False, True])
+@pytest.mark.asyncio
+async def test_retriever_grounded_knowledge_base_sync_and_async(
+    span_exporter,
+    tracer_provider,
+    meter_provider,
+    logger_provider,
+    monkeypatch,
+    is_async,
+):
+    """Grounding test: models Bedrock Knowledge Bases / Tavily returning metadata['score']."""
+    monkeypatch.setenv(
+        "OTEL_SEMCONV_STABILITY_OPT_IN", "gen_ai_latest_experimental"
+    )
+    monkeypatch.setenv(
+        "OTEL_INSTRUMENTATION_GENAI_CAPTURE_MESSAGE_CONTENT", "SPAN_ONLY"
+    )
+    instrumentor = LangChainInstrumentor()
+    instrumentor.instrument(
+        tracer_provider=tracer_provider,
+        meter_provider=meter_provider,
+        logger_provider=logger_provider,
+    )
+    try:
+        # Matches AmazonKnowledgeBasesRetriever / TavilySearchAPIRetriever document structure
+        kb_docs = [
+            Document(
+                page_content="Amazon Bedrock Knowledge Bases provides managed RAG.",
+                id="kb-result-1",
+                metadata={
+                    "source": "s3://my-bucket/rag-guide.pdf",
+                    "score": 0.89,
+                },
+            )
+        ]
+        retriever = _FakeRetriever(documents=kb_docs)
+        if is_async:
+            await retriever.ainvoke("what is bedrock rag?")
+        else:
+            retriever.invoke("what is bedrock rag?")
+
+        spans = span_exporter.get_finished_spans()
+        assert len(spans) == 1
+        docs_attr = spans[0].attributes[
+            gen_ai_attributes.GEN_AI_RETRIEVAL_DOCUMENTS
+        ]
+        parsed = json.loads(docs_attr)
+        assert len(parsed) == 1
+        assert (
+            parsed[0]["content"]
+            == "Amazon Bedrock Knowledge Bases provides managed RAG."
+        )
+        assert parsed[0]["id"] == "kb-result-1"
+        assert parsed[0]["score"] == 0.89
+    finally:
+        instrumentor.uninstrument()
+
+
+@pytest.mark.parametrize("is_async", [False, True])
+@pytest.mark.asyncio
+async def test_retriever_grounded_contextual_compression_sync_and_async(
+    span_exporter,
+    tracer_provider,
+    meter_provider,
+    logger_provider,
+    monkeypatch,
+    is_async,
+):
+    """Grounding test: models ContextualCompressionRetriever with CohereRerank returning metadata['relevance_score']."""
+    monkeypatch.setenv(
+        "OTEL_SEMCONV_STABILITY_OPT_IN", "gen_ai_latest_experimental"
+    )
+    monkeypatch.setenv(
+        "OTEL_INSTRUMENTATION_GENAI_CAPTURE_MESSAGE_CONTENT", "SPAN_ONLY"
+    )
+    instrumentor = LangChainInstrumentor()
+    instrumentor.instrument(
+        tracer_provider=tracer_provider,
+        meter_provider=meter_provider,
+        logger_provider=logger_provider,
+    )
+    try:
+        # Matches CohereRerank.compress_documents inside ContextualCompressionRetriever
+        reranked_docs = [
+            Document(
+                page_content="High relevance chunk after reranking.",
+                id="rerank-1",
+                metadata={
+                    "relevance_score": 0.94,
+                    "model": "rerank-v3.5",
+                },
+            )
+        ]
+        retriever = _FakeRetriever(documents=reranked_docs)
+        if is_async:
+            await retriever.ainvoke("rerank query")
+        else:
+            retriever.invoke("rerank query")
+
+        spans = span_exporter.get_finished_spans()
+        assert len(spans) == 1
+        docs_attr = spans[0].attributes[
+            gen_ai_attributes.GEN_AI_RETRIEVAL_DOCUMENTS
+        ]
+        parsed = json.loads(docs_attr)
+        assert len(parsed) == 1
+        assert parsed[0]["content"] == "High relevance chunk after reranking."
+        assert parsed[0]["id"] == "rerank-1"
+        assert parsed[0]["score"] == 0.94
     finally:
         instrumentor.uninstrument()

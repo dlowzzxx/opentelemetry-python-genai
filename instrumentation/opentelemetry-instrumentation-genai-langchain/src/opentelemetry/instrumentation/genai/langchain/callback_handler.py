@@ -84,8 +84,17 @@ def _conversation_id(metadata: dict[str, Any] | None) -> str | None:
 def _extract_document_score(doc: Any) -> float | int | None:
     """Extract relevance score polymorphically from a Document or Mapping.
 
-    Checks doc.score first, then falls back to doc.metadata['score'].
-    Also defensively supports Mapping/dict documents and duck-typed objects.
+    Retrieval scores are grounded in standard LangChain retrievers:
+    - Direct knowledge base and vector retrievers (e.g. AmazonKnowledgeBasesRetriever,
+      TavilySearchAPIRetriever) attach confidence/similarity scores to
+      ``doc.metadata["score"]``.
+    - Contextual compression retrievers wrapping rerankers (e.g. CohereRerank via
+      ContextualCompressionRetriever) populate ``doc.metadata["relevance_score"]``.
+    - Custom or duck-typed documents may provide a top-level ``score`` (or
+      ``relevance_score``) attribute or key.
+
+    Non-finite floats (NaN, +/-Inf) and boolean values are filtered out to ensure
+    valid RFC 8259 JSON serialization in gen_ai.retrieval.documents.
     """
     score: Any = None
     if isinstance(doc, Mapping):
