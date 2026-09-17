@@ -67,6 +67,7 @@ _GEN_AI_INVOKE_AGENT_INFERENCE_CALLS: Final = (
     "gen_ai.invoke_agent.inference_calls"
 )
 _GEN_AI_INVOKE_AGENT_TOOL_CALLS: Final = "gen_ai.invoke_agent.tool_calls"
+_GEN_AI_INVOKE_AGENT_CALLS_BUCKETS: Final = [1, 2, 4, 8, 16, 32, 64, 128]
 _GEN_AI_INVOKE_AGENT_DURATION_BUCKETS: Final = [
     0.1,
     0.2,
@@ -137,6 +138,7 @@ class _Instruments:
                 " during a single invocation."
             ),
             unit="{inference_call}",
+            explicit_bucket_boundaries_advisory=_GEN_AI_INVOKE_AGENT_CALLS_BUCKETS,
         )
         self.invoke_agent_tool_calls: Histogram = meter.create_histogram(
             name=_GEN_AI_INVOKE_AGENT_TOOL_CALLS,
@@ -145,6 +147,7 @@ class _Instruments:
                 " invocation."
             ),
             unit="{tool_call}",
+            explicit_bucket_boundaries_advisory=_GEN_AI_INVOKE_AGENT_CALLS_BUCKETS,
         )
 
 
