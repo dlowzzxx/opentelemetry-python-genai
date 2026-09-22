@@ -156,33 +156,53 @@ class TestCase(unittest.TestCase):
         self.otel.assert_has_span_named("execute_tool somefunction")
         span = self.otel.get_span_named("execute_tool somefunction")
         arguments = json.loads(span.attributes["gen_ai.tool.call.arguments"])
-        self.assertEqual(
-            arguments["code.function.parameters.primitive_int.type"], "int"
-        )
         self.assertEqual(span.attributes["gen_ai.tool.name"], "somefunction")
         self.assertEqual(
-            arguments["code.function.parameters.primitive_int.value"], 12345
+            arguments,
+            {
+                "primitive_int": 12345,
+                "dict_arg": {"key": "value"},
+                "list_arg": [1, 2, 3],
+                "heterogenous_list_arg": [123, "abc"],
+            },
         )
+
+    @patch.dict(
+        "os.environ",
+        {
+            "OTEL_INSTRUMENTATION_GENAI_CAPTURE_MESSAGE_CONTENT": "SPAN_AND_EVENT",
+        },
+    )
+    def test_async_tool_arguments_omit_defaults(self):
+        async def weather(city, *, units="celsius"):
+            return f"{city}: {units}"
+
+        wrapped = self.wrap(weather)
+        self.assertEqual(asyncio.run(wrapped("Boston")), "Boston: celsius")
+        span = self.otel.get_span_named("execute_tool weather")
         self.assertEqual(
-            arguments["code.function.parameters.dict_arg.type"], "dict"
+            json.loads(span.attributes["gen_ai.tool.call.arguments"]),
+            {"city": "Boston"},
         )
+
+    @patch.dict(
+        "os.environ",
+        {
+            "OTEL_INSTRUMENTATION_GENAI_CAPTURE_MESSAGE_CONTENT": "SPAN_AND_EVENT",
+        },
+    )
+    def test_sync_tool_arguments_include_explicit_defaults(self):
+        def weather(city, units="celsius"):
+            return f"{city}: {units}"
+
+        wrapped = self.wrap(weather)
         self.assertEqual(
-            arguments["code.function.parameters.dict_arg.value"],
-            {"key": "value"},
+            wrapped("Boston", units="fahrenheit"), "Boston: fahrenheit"
         )
+        span = self.otel.get_span_named("execute_tool weather")
         self.assertEqual(
-            arguments["code.function.parameters.list_arg.type"], "list"
-        )
-        self.assertEqual(
-            arguments["code.function.parameters.list_arg.value"], [1, 2, 3]
-        )
-        self.assertEqual(
-            arguments["code.function.parameters.heterogenous_list_arg.type"],
-            "list",
-        )
-        self.assertEqual(
-            arguments["code.function.parameters.heterogenous_list_arg.value"],
-            [123, "abc"],
+            json.loads(span.attributes["gen_ai.tool.call.arguments"]),
+            {"city": "Boston", "units": "fahrenheit"},
         )
 
     @patch.dict(
@@ -208,16 +228,74 @@ class TestCase(unittest.TestCase):
             span.attributes,
         )
 
-    def test_function_that_throws_exception(self):
-        def somefunction(arg=None):
-            raise Exception("Something went wrong")
+    @patch.dict(
+        "os.environ",
+        {
+            "OTEL_INSTRUMENTATION_GENAI_CAPTURE_MESSAGE_CONTENT": "NO_CONTENT",
+        },
+    )
+    def test_async_with_capture_content_disabled(self):
+        async def somefunction(arg=None):
+            return arg
 
         wrapped_somefunction = self.wrap(somefunction)
-        try:
+        asyncio.run(wrapped_somefunction("a string value"))
+        span = self.otel.get_span_named("execute_tool somefunction")
+
+        self.assertNotIn(
+            "gen_ai.tool.call.arguments",
+            span.attributes,
+        )
+        self.assertNotIn(
+            "gen_ai.tool.call.result",
+            span.attributes,
+        )
+
+    @patch.dict(
+        "os.environ",
+        {
+            "OTEL_INSTRUMENTATION_GENAI_CAPTURE_MESSAGE_CONTENT": "SPAN_AND_EVENT"
+        },
+    )
+    def test_function_that_throws_exception(self):
+        error = Exception("Something went wrong")
+
+        def somefunction(arg=None):
+            raise error
+
+        wrapped_somefunction = self.wrap(somefunction)
+        with self.assertRaises(Exception) as raised:
             wrapped_somefunction(12345)
-        except Exception:
-            span = self.otel.get_span_named("execute_tool somefunction")
-            self.assertEqual(span.attributes["error.type"], "Exception")
+        self.assertIs(raised.exception, error)
+        span = self.otel.get_span_named("execute_tool somefunction")
+        self.assertEqual(span.attributes["error.type"], "Exception")
+        self.assertEqual(
+            json.loads(span.attributes["gen_ai.tool.call.arguments"]),
+            {"arg": 12345},
+        )
+
+    @patch.dict(
+        "os.environ",
+        {
+            "OTEL_INSTRUMENTATION_GENAI_CAPTURE_MESSAGE_CONTENT": "SPAN_AND_EVENT"
+        },
+    )
+    def test_async_function_that_throws_exception(self):
+        error = ValueError("Tool failed")
+
+        async def somefunction(arg):
+            raise error
+
+        wrapped = self.wrap(somefunction)
+        with self.assertRaises(ValueError) as raised:
+            asyncio.run(wrapped(12345))
+        self.assertIs(raised.exception, error)
+        span = self.otel.get_span_named("execute_tool somefunction")
+        self.assertEqual(span.attributes["error.type"], "ValueError")
+        self.assertEqual(
+            json.loads(span.attributes["gen_ai.tool.call.arguments"]),
+            {"arg": 12345},
+        )
 
     @patch.dict(
         "os.environ",
@@ -234,16 +312,7 @@ class TestCase(unittest.TestCase):
         span = self.otel.get_span_named("execute_tool weather")
         arguments = json.loads(span.attributes["gen_ai.tool.call.arguments"])
         self.assertEqual(
-            arguments["code.function.parameters.city.type"], "str"
-        )
-        self.assertEqual(
-            arguments["code.function.parameters.city.value"], "Boston"
-        )
-        self.assertEqual(
-            arguments["code.function.parameters.units.type"], "str"
-        )
-        self.assertEqual(
-            arguments["code.function.parameters.units.value"], "celsius"
+            arguments, {"kwargs": {"city": "Boston", "units": "celsius"}}
         )
 
     @patch.dict(
@@ -260,13 +329,4 @@ class TestCase(unittest.TestCase):
         wrapped(10, 20)
         span = self.otel.get_span_named("execute_tool calculate")
         arguments = json.loads(span.attributes["gen_ai.tool.call.arguments"])
-        self.assertEqual(
-            arguments["code.function.parameters.args.type"], "int"
-        )
-        self.assertEqual(arguments["code.function.parameters.args.value"], 10)
-        self.assertEqual(
-            arguments["code.function.parameters.args[1].type"], "int"
-        )
-        self.assertEqual(
-            arguments["code.function.parameters.args[1].value"], 20
-        )
+        self.assertEqual(arguments, {"args": [10, 20]})
