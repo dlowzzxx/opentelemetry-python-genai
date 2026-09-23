@@ -258,7 +258,10 @@ class LocalAgentInvocation(AgentInvocation):
             attributes=attributes,
             context=self._span_context,
         )
-        self._record_call_metrics(attributes)
+        call_attributes: dict[str, AttributeValue] = {}
+        if self._agent_name is not None:
+            call_attributes[GenAI.GEN_AI_AGENT_NAME] = self._agent_name
+        self._record_call_metrics(call_attributes)
 
 
 class RemoteAgentInvocation(AgentInvocation):

@@ -1,1 +1,1 @@
-Add agent call count metrics on AgentInvocation.
+Add agent call count metrics on LocalAgentInvocation.

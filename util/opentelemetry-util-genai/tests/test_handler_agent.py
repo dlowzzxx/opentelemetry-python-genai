@@ -772,8 +772,8 @@ class TestAgentInvocationMetrics(TestBase):
             "SearchAgent",
         )
         self.assertEqual(
-            inf_points[0].attributes[GenAI.GEN_AI_REQUEST_MODEL],
-            "gpt-4o",
+            dict(inf_points[0].attributes),
+            {GenAI.GEN_AI_AGENT_NAME: "SearchAgent"},
         )
 
         self.assertIn("gen_ai.invoke_agent.tool_calls", metrics)
@@ -785,8 +785,8 @@ class TestAgentInvocationMetrics(TestBase):
             "SearchAgent",
         )
         self.assertEqual(
-            tool_points[0].attributes[GenAI.GEN_AI_REQUEST_MODEL],
-            "gpt-4o",
+            dict(tool_points[0].attributes),
+            {GenAI.GEN_AI_AGENT_NAME: "SearchAgent"},
         )
 
     def test_agent_without_calls_does_not_record_call_metrics(self) -> None:
@@ -879,7 +879,7 @@ class TestAgentInvocationMetrics(TestBase):
                     (1, 2, 4, 8, 16, 32, 64, 128),
                 )
 
-    def test_failed_agent_records_calls_with_error_type(self) -> None:
+    def test_failed_agent_records_calls_without_error_type(self) -> None:
         handler = TelemetryHandler(
             tracer_provider=self.tracer_provider,
             meter_provider=self.meter_provider,
@@ -891,8 +891,15 @@ class TestAgentInvocationMetrics(TestBase):
         metrics = self._harvest_metrics()
         self.assertIn("gen_ai.invoke_agent.inference_calls", metrics)
         inf_point = metrics["gen_ai.invoke_agent.inference_calls"][0]
-        self.assertEqual(inf_point.attributes.get("error.type"), "ValueError")
+        self.assertEqual(
+            dict(inf_point.attributes),
+            {GenAI.GEN_AI_AGENT_NAME: "FailingAgent"},
+        )
         self.assertAlmostEqual(inf_point.sum, 2.0, places=3)
+        duration_point = metrics["gen_ai.invoke_agent.duration"][0]
+        self.assertEqual(
+            duration_point.attributes.get("error.type"), "ValueError"
+        )
 
     def test_agent_name_omitted_from_metrics_when_none(self) -> None:
         handler = TelemetryHandler(
@@ -905,7 +912,7 @@ class TestAgentInvocationMetrics(TestBase):
 
         metrics = self._harvest_metrics()
         inf_point = metrics["gen_ai.invoke_agent.inference_calls"][0]
-        self.assertNotIn(GenAI.GEN_AI_AGENT_NAME, inf_point.attributes)
+        self.assertEqual(dict(inf_point.attributes), {})
 
     def _harvest_metrics(self):
         metrics = self.get_sorted_metrics()
