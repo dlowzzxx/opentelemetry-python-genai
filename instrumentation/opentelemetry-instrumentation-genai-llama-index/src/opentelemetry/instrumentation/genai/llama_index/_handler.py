@@ -5,6 +5,8 @@ from __future__ import annotations
 
 import contextvars
 import inspect
+import logging
+import math
 from base64 import b64decode
 from binascii import Error as BinasciiError
 from collections.abc import Callable, Mapping, MutableMapping, Sequence
@@ -61,6 +63,7 @@ from opentelemetry.util.genai.types import (
     Modality,
     OutputMessage,
     ReasoningPart,
+    RetrievalDocument,
     Role,
     SystemInstructionPart,
     TextPart,
@@ -68,6 +71,10 @@ from opentelemetry.util.genai.types import (
     ToolDefinition,
     UriPart,
 )
+from opentelemetry.util.genai.utils import object_to_any_value
+from opentelemetry.util.types import AnyValue
+
+_logger = logging.getLogger(__name__)
 
 _ToolExecutionAttributes = tuple[str, str | None]
 _AGENT_TOOL_ATTRIBUTES: ContextVar[
@@ -327,25 +334,27 @@ def _retrieval_top_k(retriever: BaseRetriever) -> int | None:
 
 def _retrieval_documents(
     result: object,
-) -> list[dict[str, Any]] | None:
+) -> list[RetrievalDocument] | None:
     """Convert retrieved LlamaIndex nodes to semconv document objects."""
     if not isinstance(result, Sequence):
         return None
     candidates = cast(Sequence[object], result)
-    documents: list[dict[str, Any]] = []
+    documents: list[RetrievalDocument] = []
     for candidate in candidates:
         if not isinstance(candidate, NodeWithScore):
             continue
         try:
-            document: dict[str, Any] = {
-                "id": candidate.node_id,
-                "content": candidate.node.get_content(),
-            }
-            if candidate.score is not None:
-                document["score"] = candidate.score
-            documents.append(document)
+            document_id = candidate.node_id
+            score = candidate.score
+            if score is not None and not math.isfinite(score):
+                score = None
         except BaseException:
+            _logger.warning(
+                "Failed to extract retrieval document attributes",
+                exc_info=True,
+            )
             continue
+        documents.append(RetrievalDocument(id=document_id, score=score))
     # Preserve [] for a genuine empty result, but omit the attribute when a
     # non-empty result could not be converted into semantic-convention docs.
     if documents:
@@ -526,7 +535,7 @@ def _set_workflow_output(invocation: WorkflowInvocation, result: Any) -> None:
 
 def _tool_arguments(
     tool: FunctionTool, bound_args: inspect.BoundArguments
-) -> dict[str, Any]:
+) -> AnyValue:
     """Bind tool arguments to user-facing parameter names.
 
     LlamaIndex exposes positional values under ``args`` and may inject a
@@ -552,7 +561,7 @@ def _tool_arguments(
         arguments = {"args": list(args), **kwargs}
     if tool.ctx_param_name:
         arguments.pop(tool.ctx_param_name, None)
-    return arguments
+    return object_to_any_value(arguments)
 
 
 class _LlamaIndexInvocation(BaseSpan):
@@ -1021,8 +1030,8 @@ class LlamaIndexSpanHandler(BaseSpanHandler[_LlamaIndexInvocation]):
             tool_invocation.tool_call_id = tool_call.tool_id
             tool_invocation.tool_description = tool_description
             if tool_invocation.should_capture_content:
-                tool_invocation.arguments = cast(
-                    dict[str, Any], cast(Any, tool_call).tool_kwargs
+                tool_invocation.arguments = object_to_any_value(
+                    cast(Any, tool_call).tool_kwargs
                 )
             invocation = tool_invocation
             if parent is not None and isinstance(
@@ -1211,7 +1220,9 @@ class LlamaIndexSpanHandler(BaseSpanHandler[_LlamaIndexInvocation]):
                             tool_output,
                         )
                 if span._invocation.should_capture_content:
-                    span._invocation.tool_result = tool_output.raw_output
+                    span._invocation.tool_result = object_to_any_value(
+                        tool_output.raw_output
+                    )
                 if tool_output.is_error:
                     # LlamaIndex reports failures such as unknown tools without an
                     # exception, so provide one to record error telemetry:

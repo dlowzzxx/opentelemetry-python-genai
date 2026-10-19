@@ -4,6 +4,7 @@
 """Tests for ToolCallRequestPart and ToolInvocation inheritance structure"""
 
 import os
+from decimal import Decimal
 from unittest.mock import MagicMock, patch
 
 import pytest
@@ -18,6 +19,7 @@ from opentelemetry.sdk.trace.sampling import Decision, SamplingResult
 from opentelemetry.semconv._incubating.attributes import (
     gen_ai_attributes as GenAI,
 )
+from opentelemetry.semconv.attributes import error_attributes
 from opentelemetry.trace import (
     SpanKind,
     get_current_span,
@@ -204,7 +206,7 @@ def test_tool_span_is_internal_kind():
     assert span_exporter.get_finished_spans()[0].kind == SpanKind.INTERNAL
 
 
-def test_start_tool_passes_sampling_attributes_at_span_creation():
+def test_tool_passes_sampling_attributes_at_span_creation():
     """Verify that only sampling-relevant attributes are available at start_span() time for tools."""
     captured_attributes = {}
 
@@ -299,7 +301,7 @@ def test_arguments_dict_serialized_to_json():
     {OTEL_INSTRUMENTATION_GENAI_CAPTURE_MESSAGE_CONTENT: "SPAN_ONLY"},
 )
 def test_arguments_str_passed_through():
-    """str arguments are stored as-is (no JSON wrapping)."""
+    """str arguments are recorded as-is, without JSON quoting."""
     span_exporter, handler = _make_span_exporter_and_handler()
     invocation = handler.tool("echo")
     invocation.arguments = "hello"
@@ -313,15 +315,51 @@ def test_arguments_str_passed_through():
     os.environ,
     {OTEL_INSTRUMENTATION_GENAI_CAPTURE_MESSAGE_CONTENT: "SPAN_ONLY"},
 )
-def test_arguments_int_passed_through():
-    """int arguments are stored as-is."""
+def test_arguments_int_serialized_to_json():
+    """int arguments are serialized to JSON string."""
     span_exporter, handler = _make_span_exporter_and_handler()
     invocation = handler.tool("counter")
     invocation.arguments = 42
     invocation.stop()
 
     attrs = span_exporter.get_finished_spans()[0].attributes
-    assert attrs[GenAI.GEN_AI_TOOL_CALL_ARGUMENTS] == 42
+    assert attrs[GenAI.GEN_AI_TOOL_CALL_ARGUMENTS] == "42"
+
+
+@patch.dict(
+    os.environ,
+    {OTEL_INSTRUMENTATION_GENAI_CAPTURE_MESSAGE_CONTENT: "SPAN_ONLY"},
+)
+def test_unconverted_objects_serialized():
+    class Model:
+        def model_dump(self):
+            return {"k": "v"}
+
+    span_exporter, handler = _make_span_exporter_and_handler()
+    invocation = handler.tool("echo")
+    invocation.arguments = Model()
+    invocation.tool_result = Decimal("1.5")
+    invocation.stop()
+
+    attrs = span_exporter.get_finished_spans()[0].attributes
+    assert attrs[GenAI.GEN_AI_TOOL_CALL_ARGUMENTS] == '{"k":"v"}'
+    assert attrs[GenAI.GEN_AI_TOOL_CALL_RESULT] == "1.5"
+
+
+@patch.dict(
+    os.environ,
+    {OTEL_INSTRUMENTATION_GENAI_CAPTURE_MESSAGE_CONTENT: "SPAN_ONLY"},
+)
+def test_non_finite_floats_not_recorded_as_invalid_json():
+    span_exporter, handler = _make_span_exporter_and_handler()
+    invocation = handler.tool("echo")
+    invocation.arguments = {"a": 1, "b": float("nan")}
+    invocation.tool_result = float("inf")
+    invocation.stop()
+
+    attrs = span_exporter.get_finished_spans()[0].attributes
+    assert attrs[GenAI.GEN_AI_TOOL_CALL_ARGUMENTS] == '{"a":1}'
+    assert GenAI.GEN_AI_TOOL_CALL_RESULT not in attrs
 
 
 @patch.dict(
@@ -411,7 +449,6 @@ def test_tool_should_capture_content_defaults_to_false():
     handler = _make_handler()
     invocation = handler.tool("get_weather")
     assert invocation.should_capture_content is False
-    assert invocation.should_capture_content_on_span is False
     invocation.stop()
 
 
@@ -423,7 +460,6 @@ def test_tool_should_capture_content_enabled():
     handler = _make_handler()
     invocation = handler.tool("get_weather")
     assert invocation.should_capture_content is True
-    assert invocation.should_capture_content_on_span is True
     invocation.stop()
 
 
@@ -438,7 +474,6 @@ def test_tool_content_not_on_span_in_event_only_mode():
     handler = TelemetryHandler(tracer_provider=tracer_provider)
     invocation = handler.tool("get_weather")
     assert invocation.should_capture_content is True
-    assert invocation.should_capture_content_on_span is False
     invocation.arguments = {"city": "Paris"}
     invocation.tool_result = "sunny"
     invocation.stop()
@@ -460,7 +495,6 @@ def test_tool_content_not_on_span_with_completion_hook():
     )
     invocation = handler.tool("get_weather")
     assert invocation.should_capture_content is True
-    assert invocation.should_capture_content_on_span is False
     invocation.arguments = {"city": "Paris"}
     invocation.tool_result = "sunny"
     invocation.stop()
@@ -494,7 +528,6 @@ def test_direct_invocation_instantiation_falls_back_to_env():
         name="direct_tool",
     )
     assert invocation.should_capture_content is True
-    assert invocation.should_capture_content_on_span is True
     invocation.arguments = {"arg": "val"}
     invocation.stop()
 
@@ -502,6 +535,102 @@ def test_direct_invocation_instantiation_falls_back_to_env():
     assert len(finished) == 1
     attrs = finished[0].attributes or {}
     assert GenAI.GEN_AI_TOOL_CALL_ARGUMENTS in attrs
+
+
+def _invocation_with_exporter():
+    span_exporter = InMemorySpanExporter()
+    tracer_provider = TracerProvider()
+    tracer_provider.add_span_processor(SimpleSpanProcessor(span_exporter))
+    invocation = ToolInvocation(
+        tracer=tracer_provider.get_tracer(__name__),
+        instruments=_Instruments(MeterProvider().get_meter(__name__)),
+        logger=MagicMock(),
+        completion_hook=MagicMock(spec=CompletionHook),
+        name="ctx_tool",
+    )
+    return invocation, span_exporter
+
+
+def test_suspend_restores_caller_context_and_activate_reinstates_it():
+    caller_span = get_current_span()
+    invocation, span_exporter = _invocation_with_exporter()
+    assert get_current_span() is invocation.span
+
+    invocation.suspend()
+    assert get_current_span() is caller_span
+
+    with invocation.activate():
+        assert get_current_span() is invocation.span
+    assert get_current_span() is caller_span
+
+    # Suspending does not finish the invocation.
+    assert not span_exporter.get_finished_spans()
+    invocation.stop()
+    assert len(span_exporter.get_finished_spans()) == 1
+
+
+def test_suspend_is_idempotent():
+    caller_span = get_current_span()
+    invocation, _ = _invocation_with_exporter()
+
+    invocation.suspend()
+    invocation.suspend()
+
+    assert get_current_span() is caller_span
+
+
+def test_activate_is_reentrant():
+    caller_span = get_current_span()
+    invocation, _ = _invocation_with_exporter()
+    invocation.suspend()
+
+    with invocation.activate():
+        with invocation.activate():
+            assert get_current_span() is invocation.span
+        # The inner block leaves restoring to the outer one.
+        assert get_current_span() is invocation.span
+    assert get_current_span() is caller_span
+
+
+def test_stop_inside_activate_restores_caller_context():
+    caller_span = get_current_span()
+    invocation, span_exporter = _invocation_with_exporter()
+    invocation.suspend()
+
+    with invocation.activate():
+        invocation.stop()
+
+    assert get_current_span() is caller_span
+    assert len(span_exporter.get_finished_spans()) == 1
+
+
+def test_activate_is_noop_after_finish():
+    invocation, _ = _invocation_with_exporter()
+    invocation.stop()
+    caller_span = get_current_span()
+
+    with invocation.activate():
+        assert get_current_span() is caller_span
+
+
+def test_suspended_invocation_still_finishes():
+    invocation, span_exporter = _invocation_with_exporter()
+    invocation.suspend()
+
+    invocation.stop()
+
+    assert len(span_exporter.get_finished_spans()) == 1
+
+
+def test_suspended_invocation_still_fails():
+    invocation, span_exporter = _invocation_with_exporter()
+    invocation.suspend()
+
+    invocation.fail(ValueError("boom"))
+
+    spans = span_exporter.get_finished_spans()
+    assert len(spans) == 1
+    assert spans[0].attributes[error_attributes.ERROR_TYPE] == "ValueError"
 
 
 def test_tool_invocation_context_property():
@@ -516,8 +645,7 @@ def test_tool_invocation_context_property():
         invocation.stop()
 
 
-@pytest.mark.parametrize("method_name", ["tool", "start_tool"])
-def test_tool_invocation_explicit_context(method_name: str):
+def test_tool_invocation_explicit_context():
     span_exporter = InMemorySpanExporter()
     tracer_provider = TracerProvider()
     tracer_provider.add_span_processor(SimpleSpanProcessor(span_exporter))
@@ -528,9 +656,7 @@ def test_tool_invocation_explicit_context(method_name: str):
         parent_context = set_span_in_context(parent_span)
 
     with tracer.start_as_current_span("ambient_span"):
-        tool_invocation = getattr(handler, method_name)(
-            "child_tool", context=parent_context
-        )
+        tool_invocation = handler.tool("child_tool", context=parent_context)
         tool_invocation.stop()
 
     spans = span_exporter.get_finished_spans()
@@ -540,3 +666,26 @@ def test_tool_invocation_explicit_context(method_name: str):
     )
     assert tool_span.parent is not None
     assert tool_span.parent.span_id == parent_span.get_span_context().span_id
+
+
+def test_tool_invocation_attach_to_context_false():
+    span_exporter = InMemorySpanExporter()
+    tracer_provider = TracerProvider()
+    tracer_provider.add_span_processor(SimpleSpanProcessor(span_exporter))
+    handler = TelemetryHandler(tracer_provider=tracer_provider)
+
+    tracer = tracer_provider.get_tracer("test")
+    with tracer.start_as_current_span("ambient_span") as ambient_span:
+        tool_invocation = handler.tool(
+            "detached_tool", _attach_to_context=False
+        )
+        assert get_current_span() == ambient_span
+        tool_invocation.stop()
+        assert get_current_span() == ambient_span
+
+    spans = span_exporter.get_finished_spans()
+    tool_span = next(
+        s for s in spans if s.name == "execute_tool detached_tool"
+    )
+    assert tool_span.parent is not None
+    assert tool_span.parent.span_id == ambient_span.get_span_context().span_id

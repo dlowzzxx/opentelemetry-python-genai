@@ -12,25 +12,14 @@ from opentelemetry.semconv._incubating.attributes import (
 )
 from opentelemetry.trace import SpanKind, Tracer
 from opentelemetry.util.genai._instruments import _Instruments
-from opentelemetry.util.genai._invocation import Error, GenAIInvocation
-from opentelemetry.util.genai.completion_hook import CompletionHook
-from opentelemetry.util.genai.utils import (
-    ContentCapturingMode,
-    gen_ai_json_dumps,
+from opentelemetry.util.genai._invocation import (
+    Error,
+    GenAIInvocation,
+    _json_dumps_unless_str,
 )
+from opentelemetry.util.genai.completion_hook import CompletionHook
+from opentelemetry.util.genai.utils import ContentCapturingMode
 from opentelemetry.util.types import AnyValue, AttributeValue
-
-
-def _any_value_to_attribute_value(value: AnyValue) -> AttributeValue | None:
-    """Serialize an AnyValue to an AttributeValue for OTel span attributes."""
-    if value is None:
-        return None
-    if isinstance(value, (bool, str, bytes, int, float)):
-        return value
-    try:
-        return gen_ai_json_dumps(value)
-    except (TypeError, ValueError):
-        return str(value)
 
 
 class ToolInvocation(GenAIInvocation):
@@ -69,6 +58,7 @@ class ToolInvocation(GenAIInvocation):
         tool_description: str | None = None,
         content_capturing_mode: ContentCapturingMode | None = None,
         context: Context | None = None,
+        _attach_to_context: bool = True,
     ) -> None:
         """Use handler.tool(name) instead of calling this directly.
 
@@ -96,6 +86,7 @@ class ToolInvocation(GenAIInvocation):
             span_kind=SpanKind.INTERNAL,
             start_attributes=start_attributes,
             context=context,
+            _attach_to_context=_attach_to_context,
             content_capturing_mode=content_capturing_mode,
         )
         self._name: str = name
@@ -109,15 +100,6 @@ class ToolInvocation(GenAIInvocation):
         self.tool_description: str | None = tool_description
         self._tool_type: str | None = tool_type
         self._agent_name: str | None = agent_name
-
-    @property
-    def should_capture_content_on_span(self) -> bool:
-        """Returns whether content capture is enabled on spans.
-
-        .. deprecated:: 1.2b0
-            Use :attr:`should_capture_content` instead.
-        """
-        return self._should_capture_content_on_span
 
     def _get_metric_attributes(self) -> dict[str, AttributeValue]:
         attrs: dict[str, AttributeValue] = {
@@ -140,14 +122,14 @@ class ToolInvocation(GenAIInvocation):
             (GenAI.GEN_AI_AGENT_NAME, self._agent_name),
             (
                 GenAI.GEN_AI_TOOL_CALL_ARGUMENTS,
-                _any_value_to_attribute_value(self.arguments)
-                if capture_content_on_span and self.arguments is not None
+                _json_dumps_unless_str(self.arguments)
+                if capture_content_on_span
                 else None,
             ),
             (
                 GenAI.GEN_AI_TOOL_CALL_RESULT,
-                _any_value_to_attribute_value(self.tool_result)
-                if capture_content_on_span and self.tool_result is not None
+                _json_dumps_unless_str(self.tool_result)
+                if capture_content_on_span
                 else None,
             ),
         )
@@ -168,3 +150,6 @@ class ToolInvocation(GenAIInvocation):
             attributes=self._get_metric_attributes(),
             context=self._span_context,
         )
+
+    def _on_stream_chunk(self, chunk_at: float) -> None:
+        """A streamed tool result only scopes context; the conventions define no chunk timing metrics for tools."""

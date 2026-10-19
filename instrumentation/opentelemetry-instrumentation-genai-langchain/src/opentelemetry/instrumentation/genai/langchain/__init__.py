@@ -28,15 +28,21 @@ API
 from collections.abc import Callable, Collection
 from typing import Any
 
-from langchain_core.callbacks import BaseCallbackHandler
+from langchain_core.callbacks import BaseCallbackManager
 from wrapt import wrap_function_wrapper
 
+from opentelemetry.instrumentation.genai.langchain._execution_context import (
+    _ExecutionContext,
+)
 from opentelemetry.instrumentation.genai.langchain.agent_context import (
     wrap_astream,
     wrap_stream,
 )
 from opentelemetry.instrumentation.genai.langchain.callback_handler import (
     OpenTelemetryLangChainCallbackHandler,
+)
+from opentelemetry.instrumentation.genai.langchain.invocation_manager import (
+    _InvocationManager,
 )
 from opentelemetry.instrumentation.genai.langchain.package import _instruments
 from opentelemetry.instrumentation.genai.langchain.version import __version__
@@ -52,6 +58,8 @@ class LangChainInstrumentor(BaseInstrumentor):
     This adds a custom callback handler to the LangChain callback manager
     to capture LLM telemetry.
     """
+
+    _execution_context: _ExecutionContext | None = None
 
     def __init__(
         self,
@@ -78,15 +86,23 @@ class LangChainInstrumentor(BaseInstrumentor):
             instrumentation_scope_name=__package__,
             instrumentation_scope_version=__version__,
         )
-        otel_callback_handler = OpenTelemetryLangChainCallbackHandler(
+        invocation_manager = _InvocationManager()
+        handler = OpenTelemetryLangChainCallbackHandler(
             telemetry_handler=telemetry_handler,
+            invocation_manager=invocation_manager,
         )
 
         wrap_function_wrapper(
             "langchain_core.callbacks",
             "BaseCallbackManager.__init__",
-            _BaseCallbackManagerInitWrapper(otel_callback_handler),
+            _BaseCallbackManagerInitWrapper(handler),
         )
+        self._execution_context = _ExecutionContext(
+            invocation_manager,
+            handler.on_tool_error,
+            handler.on_retriever_error,
+        )
+        self._execution_context.instrument()
         self._instrument_agent_entry_points()
 
     @staticmethod
@@ -108,6 +124,8 @@ class LangChainInstrumentor(BaseInstrumentor):
         Cleanup instrumentation (unwrap).
         """
         unwrap("langchain_core.callbacks.base.BaseCallbackManager", "__init__")
+        # The agent entry points wrap last, over the execution boundary, so
+        # they come off first.
         try:
             import langgraph.pregel
 
@@ -115,6 +133,9 @@ class LangChainInstrumentor(BaseInstrumentor):
                 unwrap(langgraph.pregel.Pregel, method)
         except (ImportError, AttributeError):
             pass
+        if self._execution_context is not None:
+            self._execution_context.uninstrument()
+            self._execution_context = None
 
 
 class _BaseCallbackManagerInitWrapper:
@@ -123,21 +144,21 @@ class _BaseCallbackManagerInitWrapper:
     """
 
     def __init__(
-        self, callback_handler: OpenTelemetryLangChainCallbackHandler
+        self,
+        handler: OpenTelemetryLangChainCallbackHandler,
     ):
-        self._otel_handler = callback_handler
+        self._handler = handler
 
     def __call__(
         self,
         wrapped: Callable[..., None],
-        instance: BaseCallbackHandler,
+        instance: BaseCallbackManager,
         args: tuple[Any, ...],
         kwargs: dict[str, Any],
     ):
         wrapped(*args, **kwargs)
-        # Ensure our OTel callback is present if not already.
-        for handler in instance.inheritable_handlers:  # type: ignore
-            if isinstance(handler, type(self._otel_handler)):
-                break
-        else:
-            instance.add_handler(self._otel_handler, inherit=True)  # type: ignore
+        if not any(
+            isinstance(handler, OpenTelemetryLangChainCallbackHandler)
+            for handler in instance.inheritable_handlers
+        ):
+            instance.add_handler(self._handler, inherit=True)

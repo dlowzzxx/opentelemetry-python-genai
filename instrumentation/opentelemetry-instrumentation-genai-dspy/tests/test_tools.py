@@ -79,7 +79,7 @@ def test_sync_tool_execution(
     args_attr = attrs.get(GenAI.GEN_AI_TOOL_CALL_ARGUMENTS)
     assert args_attr is not None
     assert json.loads(str(args_attr)) == {"x": 3, "y": 4}
-    assert attrs.get(GenAI.GEN_AI_TOOL_CALL_RESULT) == 7
+    assert attrs.get(GenAI.GEN_AI_TOOL_CALL_RESULT) == "7"
 
 
 def test_sync_tool_positional_and_mixed_args_extraction(
@@ -120,6 +120,19 @@ def test_tool_arguments_fallback_when_signature_unavailable() -> None:
     assert _extract_tool_arguments(tool, ("bar",), {}) is None
     assert _extract_tool_arguments(tool, ("bar",), {"foo": "baz"}) is None
 
+    # Callable without inspectable signature falls back similarly
+    class BuiltinTool:
+        func = dir
+
+    builtin_tool: Any = BuiltinTool()
+    assert _extract_tool_arguments(builtin_tool, (), {"foo": "bar"}) == {
+        "foo": "bar"
+    }
+    assert _extract_tool_arguments(builtin_tool, ("bar",), {}) is None
+    assert (
+        _extract_tool_arguments(builtin_tool, ("bar",), {"foo": "baz"}) is None
+    )
+
 
 @pytest.mark.anyio
 async def test_async_tool_execution(
@@ -156,7 +169,7 @@ async def test_async_tool_execution(
     args_attr = attrs.get(GenAI.GEN_AI_TOOL_CALL_ARGUMENTS)
     assert args_attr is not None
     assert json.loads(str(args_attr)) == {"a": 5, "b": 6}
-    assert attrs.get(GenAI.GEN_AI_TOOL_CALL_RESULT) == 30
+    assert attrs.get(GenAI.GEN_AI_TOOL_CALL_RESULT) == "30"
 
 
 def test_sync_tool_error(

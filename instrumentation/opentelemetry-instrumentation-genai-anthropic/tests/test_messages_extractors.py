@@ -39,6 +39,29 @@ from opentelemetry.util.genai.types import (
 )
 
 
+@pytest.mark.parametrize(
+    "invalid",
+    [
+        {},
+        {"role": "user"},
+        {"content": "Hello"},
+    ],
+)
+def test_input_messages_skip_missing_fields(invalid: dict) -> None:
+    assert get_input_messages([invalid]) == []
+    messages = get_input_messages(
+        [
+            {"role": "user", "content": "First"},
+            invalid,
+            {"role": "user", "content": "Last"},
+        ]
+    )
+    assert [message.parts for message in messages] == [
+        [TextPart(content="First")],
+        [TextPart(content="Last")],
+    ]
+
+
 def test_extract_params_reads_sampling_params_from_extra_body():
     params = extract_params(
         extra_body={"temperature": 0.7, "top_p": 0.9, "top_k": 40}
@@ -460,7 +483,7 @@ def test_invalid_document_source_is_ignored(source):
     )
 
 
-def test_set_invocation_response_attributes_records_cache_tokens():
+def test_set_invocation_response_attributes_records_usage_tokens():
     invocation = MagicMock()
     message = SimpleNamespace(
         id="msg_123",
@@ -469,6 +492,7 @@ def test_set_invocation_response_attributes_records_cache_tokens():
         usage=SimpleNamespace(
             input_tokens=10,
             output_tokens=20,
+            output_tokens_details=SimpleNamespace(thinking_tokens=12),
             cache_creation_input_tokens=15,
             cache_read_input_tokens=5,
         ),
@@ -478,8 +502,30 @@ def test_set_invocation_response_attributes_records_cache_tokens():
     )
     assert invocation.input_tokens == 30
     assert invocation.output_tokens == 20
+    assert invocation.thinking_tokens == 12
     assert invocation.cache_write_input_tokens == 15
     assert invocation.cache_read_input_tokens == 5
+
+
+def test_set_invocation_response_attributes_handles_missing_token_details():
+    invocation = MagicMock()
+    message = SimpleNamespace(
+        id="msg_123",
+        model="claude-3-7-sonnet-20250219",
+        stop_reason="end_turn",
+        usage=SimpleNamespace(
+            input_tokens=10,
+            output_tokens=20,
+            cache_creation_input_tokens=0,
+            cache_read_input_tokens=0,
+        ),
+    )
+
+    set_invocation_response_attributes(
+        invocation, message, capture_content=False
+    )
+
+    assert invocation.thinking_tokens is None
 
 
 def test_convert_server_tool_use_block():

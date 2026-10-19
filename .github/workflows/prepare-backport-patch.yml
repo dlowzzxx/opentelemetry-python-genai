@@ -16,6 +16,7 @@ on:
         - opentelemetry-instrumentation-genai-openai
         - opentelemetry-instrumentation-genai-portkey
         - opentelemetry-instrumentation-genai-qwen-agent
+        - opentelemetry-instrumentation-genai-qwenpaw
         - opentelemetry-instrumentation-genai-smolagents
         - opentelemetry-util-genai
         description: 'Package to prepare for patch release'
@@ -33,7 +34,7 @@ jobs:
   prepare:
     permissions:
       contents: write
-    runs-on: cncf-ubuntu-2-8-x86
+    runs-on: ubuntu-slim
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:

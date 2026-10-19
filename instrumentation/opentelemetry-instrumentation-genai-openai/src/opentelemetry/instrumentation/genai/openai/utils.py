@@ -5,12 +5,13 @@ from __future__ import annotations
 
 import json
 import mimetypes
-from collections.abc import Mapping, Sequence
+from collections.abc import Iterable, Mapping, Sequence
 from typing import Any
 from urllib.parse import urlparse
 
 import openai
 from openai import NotGiven
+from openai.types import CompletionUsage
 
 from opentelemetry.semconv._incubating.attributes import (
     gen_ai_attributes as GenAIAttributes,
@@ -66,6 +67,50 @@ def get_property_value(obj, property_name):
         return obj.get(property_name, None)
 
     return getattr(obj, property_name, None)
+
+
+def set_chat_usage(
+    invocation: InferenceInvocation, usage: CompletionUsage
+) -> None:
+    invocation.input_tokens = usage.prompt_tokens
+    invocation.output_tokens = usage.completion_tokens
+    prompt_details: object = get_property_value(
+        obj=usage, property_name="prompt_tokens_details"
+    )
+    completion_details: object = get_property_value(
+        obj=usage, property_name="completion_tokens_details"
+    )
+    invocation.cache_read_input_tokens = get_property_value(
+        obj=prompt_details, property_name="cached_tokens"
+    )
+    invocation.cache_write_input_tokens = get_property_value(
+        obj=prompt_details, property_name="cache_write_tokens"
+    )
+    invocation.thinking_tokens = get_property_value(
+        obj=completion_details, property_name="reasoning_tokens"
+    )
+    invocation.set_input_tokens(
+        entries=(
+            (
+                "audio",
+                get_property_value(
+                    obj=prompt_details,
+                    property_name="audio_tokens",
+                ),
+            ),
+        )
+    )
+    invocation.set_output_tokens(
+        entries=(
+            (
+                "audio",
+                get_property_value(
+                    obj=completion_details,
+                    property_name="audio_tokens",
+                ),
+            ),
+        )
+    )
 
 
 def get_server_address_and_port(
@@ -128,7 +173,15 @@ def create_chat_invocation(
     )
     invocation.temperature = get_value(kwargs.get("temperature"))
     invocation.top_p = get_value(kwargs.get("p") or kwargs.get("top_p"))
-    invocation.max_tokens = get_value(kwargs.get("max_tokens"))
+    max_tokens = get_value(kwargs.get("max_completion_tokens"))
+    if max_tokens is None:
+        max_tokens = get_value(kwargs.get("max_tokens"))
+    # Older SDKs (e.g. 1.26.0) only accept max_completion_tokens via extra_body
+    if max_tokens is None:
+        extra_body = get_value(kwargs.get("extra_body"))
+        if isinstance(extra_body, Mapping):
+            max_tokens = get_value(extra_body.get("max_completion_tokens"))
+    invocation.max_tokens = max_tokens
     invocation.presence_penalty = get_value(kwargs.get("presence_penalty"))
     invocation.frequency_penalty = get_value(kwargs.get("frequency_penalty"))
     invocation.seed = get_value(kwargs.get("seed"))
@@ -361,6 +414,8 @@ def _content_to_parts(content: Any) -> list[MessagePart]:
 
 def _prepare_input_messages(messages) -> list[InputMessage]:
     chat_messages = []
+    if not isinstance(messages, Iterable):
+        return chat_messages
     for message in messages:
         role = get_property_value(message, "role")
         name = get_property_value(message, "name")

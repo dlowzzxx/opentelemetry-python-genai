@@ -24,6 +24,33 @@ See the module docstring in ``opentelemetry.util.genai.handler`` for usage examp
 including context manager and manual lifecycle patterns.
 
 
+Context Management and Propagation
+----------------------------------
+
+Invocation factory methods on ``TelemetryHandler`` (such as ``inference``, ``workflow``, ``tool``,
+``embedding``, ``retrieval``, and ``invoke_local_agent``) accept an optional ``context`` keyword argument
+to manage context:
+
+- ``context``: An explicit OpenTelemetry ``Context`` to parent the span. When omitted, the current
+  ambient context is used.
+
+
+Stream execution context
+------------------------
+
+``SyncStreamWrapper`` and ``AsyncStreamWrapper`` scope each stream read and
+cleanup operation with ``_execution_context()``. Context is restored before
+returning a chunk to the consumer. Generator ``send``/``throw`` and
+``asend``/``athrow`` also use this scope when the underlying stream supports them.
+
+For invocation-backed streams, pass the invocation to the base constructor
+(``super().__init__(stream, invocation)``) and call ``invocation.suspend()``
+before returning the stream. The base wrapper then makes the suspended invocation
+current during reads, cleanup and finalization of an abandoned stream, so no
+``_execution_context()`` override is needed.
+Keep finalization in the existing ``_on_stream_end`` and ``_on_stream_error`` hooks.
+
+
 Modalities
 ----------
 
@@ -50,6 +77,26 @@ modalities. Token setters continue to record only ``text``, ``image``, and
 ``Modality`` replaces the previous ``Literal`` type alias. Annotations that
 also accept raw strings should use ``Modality | str`` rather than ``Modality``
 alone. Custom modalities remain strings, not additional enum members.
+
+
+Retrieval Documents
+-------------------
+
+Set ``RetrievalInvocation.documents`` using
+``opentelemetry.util.genai.types.RetrievalDocument`` objects:
+
+.. code-block:: python
+
+    from opentelemetry.util.genai.types import RetrievalDocument
+
+    with handler.retrieval(data_source_id="my-index") as invocation:
+        invocation.documents = [RetrievalDocument(id="doc-1", score=0.9)]
+
+The model contains only the optional ``id`` and ``score`` fields; unset
+fields serialize as JSON ``null``. Documents are recorded in
+``gen_ai.retrieval.documents`` only in ``SPAN_ONLY`` or ``SPAN_AND_EVENT``
+content-capture mode. Passing dictionaries is deprecated, but existing
+dictionary payloads continue to serialize unchanged.
 
 
 Environment Variables
@@ -155,6 +202,47 @@ For embedding invocations, the following attributes are set:
 
 - ``gen_ai.response.model``: Str(text-embedding-3-small)
 - ``gen_ai.usage.input_tokens``: Int(24)
+
+
+Capturing request iterators
+---------------------------
+
+Use ``IteratorCapture.from_property()`` for a named request property. It replaces
+that property's value in ``kwargs`` and records values as the SDK reads them.
+Disabled captures and missing properties leave ``kwargs`` untouched and return
+``None`` from ``snapshot()``.
+
+.. code-block:: python
+
+    from opentelemetry.util.genai.iterator_capture import IteratorCapture
+
+    messages_capture = IteratorCapture.from_property(
+        kwargs, "messages", enabled=capture_content
+    )
+    try:
+        response = sdk_call(**kwargs)
+    finally:
+        messages = messages_capture.extract(get_input_messages)
+
+For a bare value, pass ``capture.wrapped`` to the SDK:
+
+.. code-block:: python
+
+    capture = IteratorCapture(messages, enabled=capture_content)
+    try:
+        response = sdk_call(messages=capture.wrapped)
+    finally:
+        messages = capture.extract(get_input_messages)
+
+``extract(extractor)`` calls the instrumentation's extractor with a snapshot,
+using ``()`` for unread iterators and ``None`` for disabled or missing properties.
+The extractor must accept that shape and return the telemetry content.
+``extract()`` logs snapshot or conversion errors and returns ``None``. Use
+``snapshot()`` directly when no conversion is needed.
+
+Nested built-in dictionaries, lists, and tuples are supported. File objects
+pass through unchanged. Snapshots contain only the consumed portion of each
+iterator; async iterators and custom containers are not captured.
 
 
 Installation

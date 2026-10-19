@@ -3,7 +3,6 @@
 
 from __future__ import annotations
 
-import json
 import math
 from collections.abc import Mapping, Sequence
 from typing import Any, cast
@@ -23,6 +22,7 @@ from opentelemetry.instrumentation.genai.langchain.agent_context import (
 )
 from opentelemetry.instrumentation.genai.langchain.invocation_manager import (
     _InvocationManager,
+    _PromptContext,
 )
 from opentelemetry.instrumentation.genai.langchain.operation_mapping import (
     OperationName,
@@ -30,7 +30,7 @@ from opentelemetry.instrumentation.genai.langchain.operation_mapping import (
     resolve_agent_name,
 )
 from opentelemetry.instrumentation.genai.langchain.utils import (
-    _legacy_function_call_request,
+    _ai_message_parts,
     _message_name,
     _normalize_role,
     extract_token_details,
@@ -54,11 +54,13 @@ from opentelemetry.util.genai.invocation import (
 )
 from opentelemetry.util.genai.types import (
     InputMessage,
-    MessagePart,
     OutputMessage,
+    RetrievalDocument,
     Role,
-    TextPart,
-    ToolCallRequestPart,
+)
+from opentelemetry.util.genai.utils import (
+    object_to_any_value,
+    tool_arguments_to_any_value,
 )
 
 SUPPORTED_RAPI_RESPONSE_HEADERS = ("x-ms-served-model",)
@@ -69,6 +71,108 @@ CONVERSATION_ID_METADATA_KEYS = (
     "session_id",
     "conversation_id",
 )
+
+_PROMPT_TEMPLATE_TYPES = {"ChatPromptTemplate", "PromptTemplate"}
+
+
+def _prompt_template_type(runnable: Mapping[str, Any]) -> str | None:
+    runnable_id = runnable.get("id")
+    if not isinstance(runnable_id, Sequence) or isinstance(runnable_id, str):
+        return None
+    runnable_id = cast(Sequence[str], runnable_id)
+    template_type = runnable_id[-1] if runnable_id else None
+    if not isinstance(template_type, str):
+        return None
+    return template_type if template_type in _PROMPT_TEMPLATE_TYPES else None
+
+
+def _string_sequence(value: object) -> list[str]:
+    if not isinstance(value, Sequence) or isinstance(value, str):
+        return []
+    return [
+        item for item in cast(Sequence[object], value) if isinstance(item, str)
+    ]
+
+
+def _extract_prompt_context(
+    runnable: Mapping[str, Any],
+    inputs: object,
+    metadata: Mapping[str, Any] | None,
+    *,
+    capture_variables: bool = True,
+) -> _PromptContext | None:
+    template_type = _prompt_template_type(runnable)
+    if template_type is None:
+        return None
+
+    raw_template_kwargs = runnable.get("kwargs")
+    if not isinstance(raw_template_kwargs, Mapping):
+        template_kwargs: Mapping[str, object] = {}
+    else:
+        template_kwargs = cast(Mapping[str, object], raw_template_kwargs)
+
+    name = (metadata or {}).get("prompt_name")
+    if not isinstance(name, str):
+        name = template_kwargs.get("name")
+    if not isinstance(name, str):
+        runnable_name = runnable.get("name")
+        name = (
+            runnable_name
+            if isinstance(runnable_name, str)
+            and runnable_name not in _PROMPT_TEMPLATE_TYPES
+            else None
+        )
+
+    if not capture_variables:
+        return _PromptContext(name=name, variables={})
+
+    required_variables = _string_sequence(
+        template_kwargs.get("input_variables")
+    )
+    declared_variables = set(required_variables)
+    declared_variables.update(
+        _string_sequence(template_kwargs.get("optional_variables"))
+    )
+
+    partial_variables = template_kwargs.get("partial_variables")
+    if isinstance(partial_variables, Mapping):
+        partial_variables = cast(Mapping[object, object], partial_variables)
+        declared_variables.update(
+            key for key in partial_variables if isinstance(key, str)
+        )
+
+    if isinstance(inputs, Mapping):
+        runtime_variables: Mapping[str, object] = cast(
+            Mapping[str, object], inputs
+        )
+    elif len(required_variables) == 1:
+        runtime_variables = {required_variables[0]: inputs}
+    else:
+        runtime_variables = {}
+
+    effective_variables: dict[str, object] = {}
+    for source in (partial_variables, runtime_variables):
+        if not isinstance(source, Mapping):
+            continue
+        source = cast(Mapping[object, object], source)
+        for key, value in source.items():
+            if not isinstance(key, str) or key not in declared_variables:
+                continue
+            serialized_value = (
+                cast(Mapping[str, object], value)
+                if isinstance(value, Mapping)
+                else None
+            )
+            if (
+                source is partial_variables
+                and serialized_value is not None
+                and serialized_value.get("lc") == 1
+                and serialized_value.get("type") == "not_implemented"
+            ):
+                continue
+            effective_variables[key] = value
+
+    return _PromptContext(name=name, variables=effective_variables)
 
 
 def _conversation_id(metadata: dict[str, Any] | None) -> str | None:
@@ -142,32 +246,18 @@ def _extract_document_score(doc: Any) -> float | int | None:
     return None
 
 
-def _document_to_dict(doc: Any) -> dict[str, Any]:
-    """Convert a Document, duck-typed document object, or Mapping to a dict.
-
-    Extracts content (checking page_content first, then content), id,
-    and conditionally score if present and numeric.
-    """
+def _document_to_retrieval_document(doc: object) -> RetrievalDocument:
+    """Extract only the standard document ID and relevance score."""
     if isinstance(doc, Mapping):
-        doc_map = cast(Mapping[str, Any], doc)
-        content = doc_map.get("page_content")
-        if content is None:
-            content = doc_map.get("content")
+        doc_map = cast(Mapping[str, object], doc)
         doc_id = doc_map.get("id")
     else:
-        content = getattr(doc, "page_content", None)
-        if content is None:
-            content = getattr(doc, "content", None)
         doc_id = getattr(doc, "id", None)
 
-    doc_dict: dict[str, Any] = {
-        "content": content,
-        "id": doc_id,
-    }
-    score = _extract_document_score(doc)
-    if score is not None:
-        doc_dict["score"] = score
-    return doc_dict
+    return RetrievalDocument(
+        id=doc_id if isinstance(doc_id, str) else None,
+        score=_extract_document_score(doc),
+    )
 
 
 class OpenTelemetryLangChainCallbackHandler(BaseCallbackHandler):
@@ -175,14 +265,23 @@ class OpenTelemetryLangChainCallbackHandler(BaseCallbackHandler):
     A callback handler for LangChain that uses OpenTelemetry to create spans for LLM calls and chains, tools etc,. in future.
     """
 
-    def __init__(self, telemetry_handler: TelemetryHandler) -> None:
+    def __init__(
+        self,
+        telemetry_handler: TelemetryHandler,
+        *,
+        invocation_manager: _InvocationManager | None = None,
+    ) -> None:
         super().__init__()
         self._telemetry_handler = telemetry_handler
-        self._invocation_manager = _InvocationManager()
+        self._invocation_manager = (
+            invocation_manager
+            if invocation_manager is not None
+            else _InvocationManager()
+        )
 
     def on_chain_start(
         self,
-        serialized: dict[str, Any],
+        serialized: dict[str, Any] | None,
         inputs: dict[str, Any],
         *,
         run_id: UUID,
@@ -191,6 +290,7 @@ class OpenTelemetryLangChainCallbackHandler(BaseCallbackHandler):
         metadata: dict[str, Any] | None = None,
         **kwargs: Any,
     ) -> Any:
+        serialized = serialized or {}
         parent_agent_name, ancestor_agent_names = self._find_agent_context(
             parent_run_id
         )
@@ -209,6 +309,9 @@ class OpenTelemetryLangChainCallbackHandler(BaseCallbackHandler):
             agent_announcement is not None,
             ancestor_agent_names,
         )
+        parent_context = self._invocation_manager.get_parent_context(
+            parent_run_id
+        )
         conversation_id = _conversation_id(metadata)
         capture_content = self._telemetry_handler.should_capture_content()
         if operation == OperationName.INVOKE_WORKFLOW:
@@ -217,9 +320,11 @@ class OpenTelemetryLangChainCallbackHandler(BaseCallbackHandler):
                 metadata.get("workflow_name") if metadata else None
             )
             workflow = self._telemetry_handler.workflow(
-                name=workflow_name_override or workflow_name
+                name=workflow_name_override or workflow_name,
+                context=parent_context,
+                conversation_id=conversation_id,
+                _attach_to_context=False,
             )
-            workflow.conversation_id = conversation_id
             if capture_content:
                 workflow.input_messages = make_input_message(inputs)
             self._invocation_manager.add_invocation_state(
@@ -250,8 +355,10 @@ class OpenTelemetryLangChainCallbackHandler(BaseCallbackHandler):
                 ):
                     agent = self._telemetry_handler.invoke_local_agent(
                         agent_name=suggested_agent_name,
+                        context=parent_context,
+                        conversation_id=conversation_id,
+                        _attach_to_context=False,
                     )
-                    agent.conversation_id = conversation_id
                     if capture_content:
                         agent.input_messages = make_input_message(inputs)
 
@@ -274,6 +381,9 @@ class OpenTelemetryLangChainCallbackHandler(BaseCallbackHandler):
             elif agent_announcement is not None:
                 agent = self._telemetry_handler.invoke_local_agent(
                     agent_name=None,
+                    context=parent_context,
+                    conversation_id=conversation_id,
+                    _attach_to_context=False,
                 )
                 agent.input_messages = make_input_message(inputs)
                 self._invocation_manager.add_invocation_state(
@@ -292,6 +402,14 @@ class OpenTelemetryLangChainCallbackHandler(BaseCallbackHandler):
                 run_id, parent_run_id, None
             )
 
+        if prompt_context := _extract_prompt_context(
+            serialized,
+            inputs,
+            metadata,
+            capture_variables=capture_content,
+        ):
+            self._invocation_manager.set_prompt_context(run_id, prompt_context)
+
     def on_chain_end(
         self,
         outputs: dict[str, Any],
@@ -300,6 +418,7 @@ class OpenTelemetryLangChainCallbackHandler(BaseCallbackHandler):
         parent_run_id: UUID | None = None,
         **kwargs: Any,
     ) -> Any:
+        self._invocation_manager.publish_prompt_context(run_id)
         invocation = self._invocation_manager.get_invocation(run_id=run_id)
         if invocation is None or not isinstance(
             invocation, (WorkflowInvocation, LocalAgentInvocation)
@@ -426,11 +545,22 @@ class OpenTelemetryLangChainCallbackHandler(BaseCallbackHandler):
         if self._telemetry_handler.should_capture_content():
             input_messages = to_input_messages(flattened)
 
+        parent_context = self._invocation_manager.get_parent_context(
+            parent_run_id
+        )
+        prompt_context = self._invocation_manager.consume_prompt_context(
+            parent_run_id
+        )
         llm_invocation = self._telemetry_handler.inference(
             provider,
             request_model=request_model,
+            context=parent_context,
+            conversation_id=_conversation_id(metadata),
+            _attach_to_context=False,
         )
-        llm_invocation.conversation_id = _conversation_id(metadata)
+        if prompt_context is not None:
+            llm_invocation.prompt_name = prompt_context.name
+            llm_invocation.prompt_variables = prompt_context.variables
         llm_invocation.input_messages = input_messages
         llm_invocation.top_p = top_p
         llm_invocation.top_k = top_k
@@ -515,7 +645,12 @@ class OpenTelemetryLangChainCallbackHandler(BaseCallbackHandler):
                     chat_generation, "generation_info", None
                 )
                 if generation_info is not None:
-                    finish_reason = generation_info.get("finish_reason")
+                    # ChatOllama spells its stop reason `done_reason`;
+                    # fall back to it so a successful run is not later
+                    # recorded as `"error"`.
+                    finish_reason = generation_info.get(
+                        "finish_reason"
+                    ) or generation_info.get("done_reason")
 
                 if chat_generation.message:
                     # Responses API (RAPI) may include the served model in the
@@ -555,60 +690,33 @@ class OpenTelemetryLangChainCallbackHandler(BaseCallbackHandler):
                             or chat_generation.message.response_metadata.get(
                                 "stop_reason"
                             )
+                            or chat_generation.message.response_metadata.get(
+                                "done_reason"
+                            )
                         )
                     finish_reason = finish_reason or "error"
 
                     name_str = _message_name(chat_generation.message)
 
-                    if finish_reason in ("tool_calls", "tool_use"):
-                        tool_calls: list[ToolCallRequestPart] = []
-                        for tool_call in chat_generation.message.tool_calls:
-                            tool_call_request = ToolCallRequestPart(
-                                name=tool_call["name"],
-                                id=tool_call["id"],
-                                arguments=tool_call["args"],
-                            )
-                            tool_calls.append(tool_call_request)
-                        output_message = OutputMessage(
-                            role=_normalize_role(chat_generation.message)
-                            or Role.ASSISTANT.value,
-                            parts=cast(list[MessagePart], tool_calls),
-                            finish_reason=finish_reason,
-                            name=name_str,
-                        )
-                    elif (
-                        legacy_call := _legacy_function_call_request(
+                    # Build parts via ``_ai_message_parts`` so text, reasoning
+                    # and tool calls are all preserved. Only decode content when
+                    # capture is enabled; finish reason, usage, model and id are
+                    # collected unconditionally below.
+                    if self._telemetry_handler.should_capture_content():
+                        message_parts = _ai_message_parts(
                             chat_generation.message
                         )
-                    ) is not None:
-                        # Pre-tools OpenAI ``function_call`` present in
-                        # ``additional_kwargs`` — surface it as a tool-call
-                        # request part like the modern ``tool_calls`` path.
-                        output_message = OutputMessage(
-                            role=_normalize_role(chat_generation.message)
-                            or Role.ASSISTANT.value,
-                            parts=cast(list[MessagePart], [legacy_call]),
-                            finish_reason=finish_reason,
-                            name=name_str,
-                        )
-                    else:
-                        parts = [
-                            TextPart(
-                                content=chat_generation.message.content,
-                                type="text",
+                        # Skip empty messages, consistent with
+                        # ``to_output_messages``.
+                        if message_parts:
+                            output_message = OutputMessage(
+                                role=_normalize_role(chat_generation.message)
+                                or Role.ASSISTANT.value,
+                                parts=message_parts,
+                                finish_reason=finish_reason,
+                                name=name_str,
                             )
-                        ]
-                        role = (
-                            _normalize_role(chat_generation.message)
-                            or Role.ASSISTANT.value
-                        )
-                        output_message = OutputMessage(
-                            role=role,
-                            parts=cast(list[MessagePart], parts),
-                            finish_reason=finish_reason,
-                            name=name_str,
-                        )
-                    output_messages.append(output_message)
+                            output_messages.append(output_message)
                     finish_reasons.append(finish_reason)
 
                     # Get token usage if available
@@ -720,23 +828,23 @@ class OpenTelemetryLangChainCallbackHandler(BaseCallbackHandler):
             name = serialized.get("name") or "unknown"
             description = serialized.get("description")
 
-        arguments: Any
-        if inputs is not None:
-            arguments = inputs
-        else:
-            try:
-                arguments = json.loads(input_str)
-            except (json.JSONDecodeError, ValueError):
-                arguments = input_str
         agent_name, _ = self._find_agent_context(parent_run_id)
+        parent_context = self._invocation_manager.get_parent_context(
+            parent_run_id
+        )
 
         tool_invocation = self._telemetry_handler.tool(
             name=name,
             tool_type="function",
             agent_name=agent_name,
+            context=parent_context,
+            _attach_to_context=False,
         )
         tool_invocation.tool_description = description
-        tool_invocation.arguments = arguments
+        if tool_invocation.should_capture_content:
+            tool_invocation.arguments = tool_arguments_to_any_value(
+                inputs if inputs is not None else input_str
+            )
         tool_call_id = kwargs.get("tool_call_id")
         if tool_call_id:
             tool_invocation.tool_call_id = tool_call_id
@@ -758,7 +866,10 @@ class OpenTelemetryLangChainCallbackHandler(BaseCallbackHandler):
         end_tool_call_id = getattr(output, "tool_call_id", None)
         if end_tool_call_id and not tool_invocation.tool_call_id:
             tool_invocation.tool_call_id = end_tool_call_id
-        tool_invocation.tool_result = getattr(output, "content", None)
+        if tool_invocation.should_capture_content:
+            tool_invocation.tool_result = object_to_any_value(
+                getattr(output, "content", output)
+            )
         tool_invocation.stop()
         self._invocation_manager.delete_invocation_state(run_id=run_id)
 
@@ -790,8 +901,14 @@ class OpenTelemetryLangChainCallbackHandler(BaseCallbackHandler):
         meta = metadata or {}
         provider = meta.get("ls_vector_store_provider") or None
         request_model = meta.get("ls_embedding_model") or None
+        parent_context = self._invocation_manager.get_parent_context(
+            parent_run_id
+        )
         retrieval = self._telemetry_handler.retrieval(
-            provider=provider, request_model=request_model
+            provider=provider,
+            request_model=request_model,
+            context=parent_context,
+            _attach_to_context=False,
         )
         retrieval.query_text = query
         self._invocation_manager.add_invocation_state(
@@ -815,7 +932,7 @@ class OpenTelemetryLangChainCallbackHandler(BaseCallbackHandler):
 
         if self._telemetry_handler.should_capture_content():
             invocation.documents = [
-                _document_to_dict(doc) for doc in documents
+                _document_to_retrieval_document(doc) for doc in documents
             ]
         invocation.stop()
         self._invocation_manager.delete_invocation_state(run_id)
@@ -837,6 +954,12 @@ class OpenTelemetryLangChainCallbackHandler(BaseCallbackHandler):
 
         invocation.fail(error)
         self._invocation_manager.delete_invocation_state(run_id=run_id)
+
+    def on_interrupt(self, event: Any) -> None:
+        """Accept LangGraph's graph interrupt event without recording it."""
+
+    def on_resume(self, event: Any) -> None:
+        """Accept LangGraph's graph resume event without recording it."""
 
     def _find_agent_context(
         self, run_id: UUID | None
