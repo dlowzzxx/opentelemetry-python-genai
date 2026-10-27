@@ -1021,8 +1021,6 @@ class TestAgentInvocationMetrics(TestBase):
             server_port=443,
             agent_name="RemoteAgent",
         )
-        invocation.inference_calls = 2
-        invocation.tool_calls = 1
         invocation.stop()
 
         metrics = self._harvest_metrics()
